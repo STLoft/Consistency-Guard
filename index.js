@@ -20,6 +20,7 @@ import {
     getRequestHeaders,
 } from '../../../../script.js';
 import { callGenericPopup, POPUP_TYPE } from '../../../popup.js';
+import { ConnectionManagerRequestService } from '../../shared.js';
 
 const EXT = 'consistencyGuard';
 const LOG = '[ConsistencyGuard]';
@@ -48,7 +49,7 @@ const SOURCES = {
 };
 
 /* ------------------------------------------------------------------ */
-/* Jev 판정 질문 (모두 Noul: 확률이 높을수록 오류)                         */
+/* Jev 판정 질문 (모두 boolean: true 확률이 높을수록 오류)                  */
 /*  needs: 이 중 하나라도 켜져 있고 내용이 있어야 질문을 보냄               */
 /* ------------------------------------------------------------------ */
 
@@ -103,13 +104,8 @@ const CHECKS = {
 const DEFAULTS = {
     enabled: true,
     mode: 'auto', // auto | confirm | notify
-    jevProfileId: '',          // 비어 있으면 직접 입력 사용
-    jevModelOverride: '',      // 프로필 사용 시 모델 덮어쓰기 (비우면 자동)
-    jevBaseUrl: 'https://api.typesafe.ai',
-    jevApiKey: '',
-    jevModel: 'jev-latest',
-    useCorsProxy: false,
-    jevTimeoutMs: 3000,
+    jevProfileId: '',
+    jevTimeoutMs: 5000,
     threshold: 0.6,
     recentMessages: 8,
     sources: {
@@ -265,71 +261,68 @@ function activeChecks(present) {
 }
 
 /* ------------------------------------------------------------------ */
-/* Jev 연결 해석 (연결 프로필 또는 직접 입력)                              */
+/* Jev 연결: 연결 프로필 + 서버 플러그인 (키는 서버 안에서만 읽음)          */
 /* ------------------------------------------------------------------ */
 
-// Jev를 제공하는 게이트웨이별 System One 엔드포인트
-const JEV_PROVIDERS = {
-    vercel:     { name: 'Vercel AI Gateway', base: 'https://ai-gateway.vercel.sh/typesafe', model: 'typesafe-ai/jev' },
-    openrouter: { name: 'OpenRouter',        base: 'https://openrouter.ai/api',             model: 'jev-1.13' },
-    typesafe:   { name: 'TypeSafe',          base: 'https://api.typesafe.ai',               model: 'jev-latest' },
-};
+// 자체 플러그인을 먼저 찾고, 없으면 이미 설치된 제브 리콜 플러그인을 재사용
+const PLUGIN_ENDPOINTS = [
+    '/api/plugins/consistency-guard/evaluate',
+    '/api/plugins/jev-recall/evaluate',
+];
+let workingEndpoint = null;
 
-const secretCache = new Map();
-
-function getProfiles() {
-    return extension_settings.connectionManager?.profiles || [];
-}
-
-function detectProvider(profile) {
-    const url = String(profile?.['api-url'] || '');
-    if (profile?.api === 'vercel' || /ai-gateway\.vercel\.sh/.test(url)) return 'vercel';
-    if (profile?.api === 'openrouter' || /openrouter\.ai/.test(url)) return 'openrouter';
-    if (/typesafe\.ai/.test(url)) return 'typesafe';
-    return null;
-}
-
-function describeProfile(profile) {
-    const p = detectProvider(profile);
-    if (p) return { provider: p, base: JEV_PROVIDERS[p].base, defaultModel: JEV_PROVIDERS[p].model, name: JEV_PROVIDERS[p].name };
-    // 알 수 없는 커스텀 주소: /v1, /chat/completions 꼬리를 떼고 /v1/systemone을 붙임
-    const base = String(profile?.['api-url'] || '').replace(/\/+$/, '').replace(/\/chat\/completions$/, '').replace(/\/v1$/, '');
-    return { provider: null, base, defaultModel: 'jev-latest', name: '사용자 지정 주소' };
-}
-
-async function readSecret(key, id) {
-    const cacheKey = `${key}|${id ?? ''}`;
-    if (secretCache.has(cacheKey)) return secretCache.get(cacheKey);
-    const res = await fetch('/api/secrets/find', {
-        method: 'POST',
-        headers: getRequestHeaders(),
-        body: JSON.stringify(id ? { key, id } : { key }),
-    });
-    if (!res.ok) {
-        throw new Error('ST가 프로필의 API 키를 넘겨주지 않았습니다. config.yaml에서 allowKeysExposure: true로 바꾸고 재시작하거나, Jev 연결을 직접 입력으로 바꾸세요.');
-    }
-    const { value } = await res.json();
-    if (!value) throw new Error(`프로필에 저장된 키(${key})가 비어 있습니다.`);
-    secretCache.set(cacheKey, value);
-    return value;
-}
-
-async function resolveJevConnection() {
+function getJevProfile() {
     const s = settings();
-    if (!s.jevProfileId) {
-        if (!s.jevApiKey) throw new Error('Jev API 키가 없습니다.');
-        return { base: s.jevBaseUrl, key: s.jevApiKey, model: s.jevModel };
-    }
-    const profile = getProfiles().find(p => p.id === s.jevProfileId);
+    if (!s.jevProfileId) throw new Error('Jev 연결 프로필을 선택해 주세요.');
+    const profile = ConnectionManagerRequestService.getProfile(s.jevProfileId);
     if (!profile) throw new Error('선택한 Jev 연결 프로필을 찾을 수 없습니다.');
+    if (profile.api !== 'custom') throw new Error('Jev 프로필은 Custom (OpenAI-compatible) 이어야 합니다.');
+    if (!/jev/i.test(String(profile.model || ''))) throw new Error('선택한 프로필의 모델이 Jev가 아닙니다.');
+    let host = '';
+    try { host = new URL(String(profile['api-url'] || '')).hostname; } catch { /* 아래에서 처리 */ }
+    if (host !== 'ai-gateway.vercel.sh') throw new Error('프로필 URL은 https://ai-gateway.vercel.sh/v1 이어야 합니다.');
+    return profile;
+}
 
-    const info = describeProfile(profile);
-    if (!info.base) throw new Error('프로필에서 API 주소를 찾을 수 없습니다.');
-    const secretName = profile.api === 'custom' || !profile.api ? 'api_key_custom' : `api_key_${profile.api}`;
-    const key = await readSecret(secretName, profile['secret-id']);
-    const profileModel = String(profile.model || '');
-    const model = s.jevModelOverride.trim() || (/jev/i.test(profileModel) ? profileModel : info.defaultModel);
-    return { base: info.base, key, model };
+function compactProfile(profile) {
+    return {
+        id: String(profile.id || ''),
+        name: String(profile.name || ''),
+        api: String(profile.api || ''),
+        apiUrl: String(profile['api-url'] || ''),
+        model: String(profile.model || ''),
+        secretId: String(profile['secret-id'] || ''),
+    };
+}
+
+function answerProbability(answer) {
+    const n = Number(answer?.probability ?? answer?.noul ?? answer?.true_probability ?? 0);
+    return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
+}
+
+async function postEvaluation(body, timeoutMs) {
+    const candidates = workingEndpoint ? [workingEndpoint] : PLUGIN_ENDPOINTS;
+    let lastError = null;
+    for (const endpoint of candidates) {
+        const res = await fetch(endpoint, {
+            method: 'POST',
+            headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+            body: JSON.stringify(body),
+            signal: AbortSignal.timeout(timeoutMs),
+        });
+        if (res.status === 404) { lastError = null; continue; }
+        const text = await res.text();
+        let payload = null;
+        try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
+        if (!res.ok) {
+            const detail = payload?.error?.message || payload?.error || text || res.statusText;
+            lastError = new Error(`Jev HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+            break;
+        }
+        workingEndpoint = endpoint;
+        return payload;
+    }
+    throw lastError || new Error('Jev 서버 플러그인을 찾지 못했습니다. plugins 폴더 설치와 enableServerPlugins: true를 확인하고 ST를 재시작하세요.');
 }
 
 /* ------------------------------------------------------------------ */
@@ -339,52 +332,30 @@ async function resolveJevConnection() {
 async function judgeWithJev(state, checks) {
     const s = settings();
     if (!checks.length) return {};
-    const conn = await resolveJevConnection();
+    const profile = getJevProfile();
 
-    const questions = Object.fromEntries(checks.map(([key, def]) =>
-        [key, { type: 'noul', instructions: def.instructions }]));
+    const questions = Object.fromEntries(checks.map(([key, def]) => [key, {
+        type: 'boolean',
+        instructions: def.instructions,
+        criteria: {
+            true: 'NEW_MESSAGE clearly contradicts or violates what the provided sources establish.',
+            false: 'NEW_MESSAGE is consistent, or the provided sources do not establish this detail at all.',
+        },
+    }]));
 
-    const target = `${conn.base.replace(/\/+$/, '')}/v1/systemone`;
-    const url = s.useCorsProxy ? `/proxy/${target}` : target;
-    const headers = {
-        ...(s.useCorsProxy ? getRequestHeaders() : { 'Content-Type': 'application/json' }),
-        Authorization: `Bearer ${conn.key}`,
-    };
-
-    const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), s.jevTimeoutMs);
     const t0 = performance.now();
-    try {
-        const res = await fetch(url, {
-            method: 'POST',
-            headers,
-            body: JSON.stringify({ model: conn.model, state, questions }),
-            signal: controller.signal,
-        });
-        if (!res.ok) throw new Error(`Jev HTTP ${res.status}: ${await res.text()}`);
-        const data = await res.json();
-        console.debug(LOG, `Jev ${Math.round(performance.now() - t0)}ms`, data);
+    const payload = await postEvaluation({ profile: compactProfile(profile), state, questions }, s.jevTimeoutMs);
+    console.debug(LOG, `Jev ${Math.round(performance.now() - t0)}ms`, payload);
+    if (!payload?.answers) throw new Error('Jev 응답에 answers가 없습니다.');
 
-        const scores = {};
-        for (const [key, ans] of Object.entries(data.answers || {})) {
-            scores[key] = typeof ans.noul === 'number' ? ans.noul : 0;
-        }
-        return scores;
-    } finally {
-        clearTimeout(timer);
-    }
+    const scores = {};
+    for (const [key] of checks) scores[key] = answerProbability(payload.answers[key]);
+    return scores;
 }
 
 /* ------------------------------------------------------------------ */
 /* 2단계: 별도 API로 수정 지시문 생성                                     */
 /* ------------------------------------------------------------------ */
-
-async function getRequestService() {
-    const ctx = getContext();
-    if (ctx.ConnectionManagerRequestService) return ctx.ConnectionManagerRequestService;
-    const mod = await import('../../shared.js');
-    return mod.ConnectionManagerRequestService;
-}
 
 async function generateDirective(state, flagged) {
     const s = settings();
@@ -407,8 +378,7 @@ If none of the flagged problems is real, output exactly: NO_ISSUE`;
 
     let text;
     if (s.directiveProfileId) {
-        const svc = await getRequestService();
-        const result = await svc.sendRequest(
+        const result = await ConnectionManagerRequestService.sendRequest(
             s.directiveProfileId,
             [{ role: 'system', content: system }, { role: 'user', content: user }],
             s.directiveMaxTokens,
@@ -504,7 +474,8 @@ async function runCheck(messageId, { manual = false } = {}) {
             scores = await judgeWithJev(state, checks);
         } catch (e) {
             console.warn(LOG, 'Jev 실패, 건너뜀:', e);
-            if (manual || e.name !== 'AbortError') toast('error', `Jev 판정 실패: ${e.message}`);
+            const timedOut = e.name === 'TimeoutError' || e.name === 'AbortError';
+            if (manual || !timedOut) toast('error', `Jev 판정 실패: ${e.message}`);
             return;
         }
         const flagged = Object.entries(scores)
@@ -612,6 +583,75 @@ function refreshCheckAvailability() {
     $('#cg_extra').toggle(!!s.sources.extra);
 }
 
+function setStatus(sel, text, kind = '') {
+    $(sel).text(text).toggleClass('is-ok', kind === 'ok').toggleClass('is-error', kind === 'error');
+}
+
+function refreshJevStatus() {
+    const s = settings();
+    try {
+        const profile = getJevProfile();
+        setStatus('#cg_jev_status', `${profile.name} · ${profile.model} · 저장된 연결 키 사용`, 'ok');
+    } catch (e) {
+        setStatus('#cg_jev_status', s.jevProfileId ? e.message : '', s.jevProfileId ? 'error' : '');
+    }
+}
+
+function installProfileDropdowns() {
+    const s = settings();
+    try {
+        ConnectionManagerRequestService.handleDropdown(
+            '#cg_jev_profile',
+            s.jevProfileId,
+            profile => {
+                s.jevProfileId = profile?.id || '';
+                saveSettingsDebounced();
+                refreshJevStatus();
+            },
+            () => {},
+            () => refreshJevStatus(),
+            profile => {
+                if (s.jevProfileId === profile?.id) s.jevProfileId = '';
+                refreshJevStatus();
+            },
+        );
+        ConnectionManagerRequestService.handleDropdown(
+            '#cg_profile',
+            s.directiveProfileId,
+            profile => {
+                s.directiveProfileId = profile?.id || '';
+                saveSettingsDebounced();
+            },
+            () => {},
+            () => {},
+            profile => {
+                if (s.directiveProfileId === profile?.id) s.directiveProfileId = '';
+            },
+        );
+    } catch (e) {
+        setStatus('#cg_jev_status', `연결 관리자를 불러오지 못했습니다: ${e.message}`, 'error');
+    }
+    refreshJevStatus();
+}
+
+async function testJevConnection() {
+    const $btn = $('#cg_jev_test').addClass('disabled');
+    setStatus('#cg_jev_test_status', '시험 중…');
+    try {
+        const t0 = performance.now();
+        const scores = await judgeWithJev(
+            { CHARACTER_NAME: 'Mina', USER_NAME: 'User', CHARACTER_SHEET: 'Mina has short black hair.', NEW_MESSAGE: 'Mina tucked her long blonde hair behind her ear.' },
+            [['character', CHECKS.character]],
+        );
+        const ms = Math.round(performance.now() - t0);
+        setStatus('#cg_jev_test_status', `성공 · ${ms}ms · 모순 확률 ${Math.round(scores.character * 100)}%`, 'ok');
+    } catch (e) {
+        setStatus('#cg_jev_test_status', e.message, 'error');
+    } finally {
+        $btn.removeClass('disabled');
+    }
+}
+
 function renderSettings() {
     const s = settings();
     const sourceBoxes = Object.entries(SOURCES).map(([k, d]) =>
@@ -649,19 +689,11 @@ function renderSettings() {
 
       <h4>Jev 연결</h4>
       <div class="cg-row"><label for="cg_jev_profile">연결 프로필</label><select id="cg_jev_profile" class="text_pole"></select></div>
-      <div id="cg_jev_profile_box">
-        <small id="cg_jev_info"></small>
-        <div class="cg-row"><label for="cg_jev_model">모델</label><input id="cg_jev_model" class="text_pole" type="text"></div>
-        <small>프로필의 키를 쓰려면 config.yaml에 allowKeysExposure: true가 필요합니다.</small>
-      </div>
-      <div id="cg_jev_manual_box">
-        <small>API 키는 settings.json에 평문으로 저장됩니다.</small>
-        <div class="cg-row"><label for="cg_base">Base URL</label><input id="cg_base" class="text_pole" type="text"></div>
-        <div class="cg-row"><label for="cg_key">API 키</label><input id="cg_key" class="text_pole" type="password"></div>
-        <div class="cg-row"><label for="cg_model">모델</label><input id="cg_model" class="text_pole" type="text"></div>
-      </div>
-      <label class="checkbox_label"><input type="checkbox" id="cg_proxy"> ST CORS 프록시 경유 (config.yaml의 enableCorsProxy 필요)</label>
-      <div class="cg-row"><label for="cg_timeout">타임아웃(ms)</label><input id="cg_timeout" class="text_pole" type="number" min="500" step="100"></div>
+      <small>Custom (OpenAI-compatible) · URL https://ai-gateway.vercel.sh/v1 · 모델 typesafe-ai/jev 프로필을 고르세요. 키는 서버 플러그인이 서버 안에서만 읽습니다.</small>
+      <small id="cg_jev_status" class="cg-status"></small>
+      <div class="cg-row"><label for="cg_timeout">타임아웃(ms)</label><input id="cg_timeout" class="text_pole" type="number" min="1000" step="500"></div>
+      <div class="cg-row"><div id="cg_jev_test" class="menu_button menu_button_icon"><i class="fa-solid fa-plug-circle-check"></i><span>연결 시험</span></div>
+        <small id="cg_jev_test_status" class="cg-status"></small></div>
 
       <h4>지시문 생성</h4>
       <div class="cg-row"><label for="cg_profile">연결 프로필</label><select id="cg_profile" class="text_pole"></select></div>
@@ -681,17 +713,13 @@ function renderSettings() {
     };
     bind('#cg_enabled', 'enabled', Boolean, 'checked');
     bind('#cg_mode', 'mode');
-    bind('#cg_base', 'jevBaseUrl');
-    bind('#cg_key', 'jevApiKey');
-    bind('#cg_model', 'jevModel');
-    bind('#cg_proxy', 'useCorsProxy', Boolean, 'checked');
     bind('#cg_timeout', 'jevTimeoutMs', Number);
     bind('#cg_recent', 'recentMessages', Number);
     bind('#cg_extra', 'extraContextTemplate');
     bind('#cg_dirtokens', 'directiveMaxTokens', Number);
     bind('#cg_toasts', 'showToasts', Boolean, 'checked');
     bind('#cg_threshold', 'threshold', Number);
-    bind('#cg_jev_model', 'jevModelOverride');
+
     const showT = () => $('#cg_threshold_val').text(`(${Number(s.threshold).toFixed(2)})`);
     showT(); $('#cg_threshold').on('input', showT);
 
@@ -706,38 +734,8 @@ function renderSettings() {
     });
     refreshCheckAvailability();
 
-    const fillSelect = (sel, emptyLabel, value) => {
-        const $sel = $(sel).empty().append(`<option value="">${emptyLabel}</option>`);
-        getProfiles().forEach(p => $sel.append(`<option value="${escapeHtml(p.id)}">${escapeHtml(p.name)}</option>`));
-        $sel.val(value);
-    };
-    const refreshJevBox = () => {
-        const profile = getProfiles().find(p => p.id === s.jevProfileId);
-        $('#cg_jev_profile_box').toggle(!!s.jevProfileId);
-        $('#cg_jev_manual_box').toggle(!s.jevProfileId);
-        if (profile) {
-            const info = describeProfile(profile);
-            $('#cg_jev_info').text(`${info.name}로 인식 · ${info.base || '주소 없음'}/v1/systemone`);
-            $('#cg_jev_model').attr('placeholder', `비우면 자동 (${/jev/i.test(profile.model || '') ? profile.model : info.defaultModel})`);
-        }
-    };
-    const fillAll = () => {
-        fillSelect('#cg_profile', '(메인 API 사용)', s.directiveProfileId);
-        fillSelect('#cg_jev_profile', '(직접 입력)', s.jevProfileId);
-        refreshJevBox();
-    };
-    fillAll();
-    $('#cg_profile, #cg_jev_profile').on('focus', fillAll);
-    $('#cg_profile').on('change', function () {
-        s.directiveProfileId = this.value;
-        saveSettingsDebounced();
-    });
-    $('#cg_jev_profile').on('change', function () {
-        s.jevProfileId = this.value;
-        secretCache.clear();
-        saveSettingsDebounced();
-        refreshJevBox();
-    });
+    installProfileDropdowns();
+    $('#cg_jev_test').on('click', testJevConnection);
 }
 
 /* ------------------------------------------------------------------ */

@@ -9,3 +9,7 @@
 .cg-feedback summary { cursor: pointer; user-select: none; }
 .cg-feedback pre { white-space: pre-wrap; margin: 4px 0 0; font-family: inherit; }
 .cg-settings .cg-unavailable { opacity: .45; }
+.cg-settings .cg-status { opacity: .78; }
+.cg-settings .cg-status.is-ok { color: var(--SmartThemeQuoteColor); opacity: 1; }
+.cg-settings .cg-status.is-error { color: var(--warning, #e5a50a); opacity: 1; }
+.cg-settings .menu_button.disabled { pointer-events: none; opacity: .5; }
