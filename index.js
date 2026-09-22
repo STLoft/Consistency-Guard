@@ -105,7 +105,7 @@ const DEFAULTS = {
     enabled: true,
     mode: 'auto', // auto | confirm | notify
     jevProfileId: '',
-    jevTimeoutMs: 5000,
+    jevTimeoutMs: 8000,
     threshold: 0.6,
     recentMessages: 8,
     sources: {
@@ -131,6 +131,11 @@ function settings() {
     const s = extension_settings[EXT];
     for (const [k, v] of Object.entries(DEFAULTS)) {
         if (s[k] === undefined) s[k] = structuredClone(v);
+    }
+    // 예전 기본값(3000ms)은 게이트웨이 첫 응답에 너무 짧아 한 번만 올림
+    if (!s.timeoutMigrated) {
+        if (s.jevTimeoutMs <= 3000) s.jevTimeoutMs = 8000;
+        s.timeoutMigrated = true;
     }
     for (const group of ['sources', 'checks']) {
         for (const [k, v] of Object.entries(DEFAULTS[group])) {
@@ -271,16 +276,25 @@ const PLUGIN_ENDPOINTS = [
 ];
 let workingEndpoint = null;
 
+function jevProvider(profile) {
+    if (profile?.api === 'openrouter') return 'OpenRouter';
+    if (profile?.api !== 'custom') return null;
+    let host = '';
+    try { host = new URL(String(profile['api-url'] || '')).hostname; } catch { /* 무시 */ }
+    if (host === 'ai-gateway.vercel.sh') return 'Vercel';
+    if (host === 'openrouter.ai') return 'OpenRouter';
+    return null;
+}
+
 function getJevProfile() {
     const s = settings();
     if (!s.jevProfileId) throw new Error('Jev 연결 프로필을 선택해 주세요.');
     const profile = ConnectionManagerRequestService.getProfile(s.jevProfileId);
     if (!profile) throw new Error('선택한 Jev 연결 프로필을 찾을 수 없습니다.');
-    if (profile.api !== 'custom') throw new Error('Jev 프로필은 Custom (OpenAI-compatible) 이어야 합니다.');
     if (!/jev/i.test(String(profile.model || ''))) throw new Error('선택한 프로필의 모델이 Jev가 아닙니다.');
-    let host = '';
-    try { host = new URL(String(profile['api-url'] || '')).hostname; } catch { /* 아래에서 처리 */ }
-    if (host !== 'ai-gateway.vercel.sh') throw new Error('프로필 URL은 https://ai-gateway.vercel.sh/v1 이어야 합니다.');
+    if (!jevProvider(profile)) {
+        throw new Error('Jev 프로필은 OpenRouter 프로필이거나, URL이 ai-gateway.vercel.sh 또는 openrouter.ai인 Custom 프로필이어야 합니다.');
+    }
     return profile;
 }
 
@@ -296,7 +310,7 @@ function compactProfile(profile) {
 }
 
 function answerProbability(answer) {
-    const n = Number(answer?.probability ?? answer?.noul ?? answer?.true_probability ?? 0);
+    const n = Number(answer?.probability ?? answer?.noul ?? answer?.true_probability ?? answer?.probabilities?.true ?? 0);
     return Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0;
 }
 
@@ -316,7 +330,9 @@ async function postEvaluation(body, timeoutMs) {
         try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
         if (!res.ok) {
             const detail = payload?.error?.message || payload?.error || text || res.statusText;
-            lastError = new Error(`Jev HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+            const hint = endpoint.includes('jev-recall') && /Custom/.test(String(detail))
+                ? ' (OpenRouter 프로필은 동봉한 consistency-guard 서버 플러그인이 필요합니다)' : '';
+            lastError = new Error(`Jev HTTP ${res.status}: ${String(detail).slice(0, 300)}${hint}`);
             break;
         }
         workingEndpoint = endpoint;
@@ -591,7 +607,7 @@ function refreshJevStatus() {
     const s = settings();
     try {
         const profile = getJevProfile();
-        setStatus('#cg_jev_status', `${profile.name} · ${profile.model} · 저장된 연결 키 사용`, 'ok');
+        setStatus('#cg_jev_status', `${profile.name} · ${jevProvider(profile)} · ${profile.model} · 저장된 연결 키 사용`, 'ok');
     } catch (e) {
         setStatus('#cg_jev_status', s.jevProfileId ? e.message : '', s.jevProfileId ? 'error' : '');
     }
@@ -689,7 +705,7 @@ function renderSettings() {
 
       <h4>Jev 연결</h4>
       <div class="cg-row"><label for="cg_jev_profile">연결 프로필</label><select id="cg_jev_profile" class="text_pole"></select></div>
-      <small>Custom (OpenAI-compatible) · URL https://ai-gateway.vercel.sh/v1 · 모델 typesafe-ai/jev 프로필을 고르세요. 키는 서버 플러그인이 서버 안에서만 읽습니다.</small>
+      <small>Vercel: Custom · https://ai-gateway.vercel.sh/v1 · typesafe-ai/jev<br>OpenRouter: OpenRouter 프로필 · 모델 ~typesafe/jev-latest (또는 typesafe/jev-1.13)<br>키는 서버 플러그인이 서버 안에서만 읽습니다.</small>
       <small id="cg_jev_status" class="cg-status"></small>
       <div class="cg-row"><label for="cg_timeout">타임아웃(ms)</label><input id="cg_timeout" class="text_pole" type="number" min="1000" step="500"></div>
       <div class="cg-row"><div id="cg_jev_test" class="menu_button menu_button_icon"><i class="fa-solid fa-plug-circle-check"></i><span>연결 시험</span></div>

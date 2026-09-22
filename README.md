@@ -12,11 +12,20 @@
 
 ## 연결 프로필
 
-제브 리콜과 같은 프로필을 그대로 선택하면 됩니다.
+아래 중 하나를 만들어 선택합니다. 키는 확장 설정에 저장되지 않고, 서버 플러그인이 서버 안에서만 읽습니다.
 
+**Vercel AI Gateway**
 - API: Custom (OpenAI-compatible)
 - URL: `https://ai-gateway.vercel.sh/v1`
 - 모델: `typesafe-ai/jev`
 - 키: Vercel AI Gateway API 키
 
-키는 확장 설정에 저장되지 않고, 서버 플러그인이 서버 안에서만 읽습니다.
+**OpenRouter (권장 방식)**
+- API: Custom (OpenAI-compatible)
+- URL: `https://openrouter.ai/api/v1`
+- 모델: `~typesafe/jev-latest` 또는 `typesafe/jev-1.13`
+- 키: OpenRouter API 키
+
+ST의 OpenRouter 프로필도 지원하지만, 모델 목록에 Jev가 안 보일 수 있어 Custom 방식이 더 편합니다.
+
+OpenRouter는 동봉한 `consistency-guard` 서버 플러그인에서만 처리됩니다. 제브 리콜 플러그인은 Vercel만 지원합니다.
