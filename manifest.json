@@ -1,0 +1,11 @@
+{
+    "display_name": "Consistency Guard (Jev)",
+    "loading_order": 100,
+    "requires": [],
+    "optional": [],
+    "js": "index.js",
+    "css": "style.css",
+    "author": "you",
+    "version": "0.3.0",
+    "homePage": ""
+}

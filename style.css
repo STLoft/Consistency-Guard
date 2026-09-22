@@ -1,0 +1,11 @@
+.cg-settings .cg-row { display: flex; gap: 8px; align-items: center; margin: 4px 0; flex-wrap: wrap; }
+.cg-settings .cg-row > label { flex: 1 1 140px; }
+.cg-settings .cg-row > input.text_pole,
+.cg-settings .cg-row > select.text_pole { flex: 2 1 180px; }
+.cg-settings .cg-checks { display: grid; grid-template-columns: 1fr; gap: 2px; margin: 4px 0 8px; }
+.cg-settings small { opacity: .75; display: block; margin-bottom: 6px; }
+.cg-settings h4 { margin: 10px 0 4px; }
+.cg-feedback { margin-top: 6px; border-left: 3px solid var(--SmartThemeQuoteColor, #888); padding: 4px 8px; font-size: .9em; opacity: .85; }
+.cg-feedback summary { cursor: pointer; user-select: none; }
+.cg-feedback pre { white-space: pre-wrap; margin: 4px 0 0; font-family: inherit; }
+.cg-settings .cg-unavailable { opacity: .45; }
