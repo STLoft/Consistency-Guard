@@ -283,6 +283,7 @@ function jevProvider(profile) {
     try { host = new URL(String(profile['api-url'] || '')).hostname; } catch { /* 무시 */ }
     if (host === 'ai-gateway.vercel.sh') return 'Vercel';
     if (host === 'openrouter.ai') return 'OpenRouter';
+    if (host === 'api.typesafe.ai') return 'TypeSafe';
     return null;
 }
 
@@ -293,7 +294,7 @@ function getJevProfile() {
     if (!profile) throw new Error('선택한 Jev 연결 프로필을 찾을 수 없습니다.');
     if (!/jev/i.test(String(profile.model || ''))) throw new Error('선택한 프로필의 모델이 Jev가 아닙니다.');
     if (!jevProvider(profile)) {
-        throw new Error('Jev 프로필은 OpenRouter 프로필이거나, URL이 ai-gateway.vercel.sh 또는 openrouter.ai인 Custom 프로필이어야 합니다.');
+        throw new Error('Jev 프로필은 OpenRouter 프로필이거나, URL이 ai-gateway.vercel.sh, openrouter.ai 또는 api.typesafe.ai인 Custom 프로필이어야 합니다.');
     }
     return profile;
 }
@@ -705,7 +706,7 @@ function renderSettings() {
 
       <h4>Jev 연결</h4>
       <div class="cg-row"><label for="cg_jev_profile">연결 프로필</label><select id="cg_jev_profile" class="text_pole"></select></div>
-      <small>Vercel: Custom · https://ai-gateway.vercel.sh/v1 · typesafe-ai/jev<br>OpenRouter: OpenRouter 프로필 · 모델 ~typesafe/jev-latest (또는 typesafe/jev-1.13)<br>키는 서버 플러그인이 서버 안에서만 읽습니다.</small>
+      <small>Vercel: Custom · https://ai-gateway.vercel.sh/v1 · typesafe-ai/jev<br>OpenRouter: OpenRouter 프로필 · 모델 ~typesafe/jev-latest (또는 typesafe/jev-1.13)<br>TypeSafe 공식: Custom · https://api.typesafe.ai/v1 · jev-latest<br>키는 서버 플러그인이 서버 안에서만 읽습니다.</small>
       <small id="cg_jev_status" class="cg-status"></small>
       <div class="cg-row"><label for="cg_timeout">타임아웃(ms)</label><input id="cg_timeout" class="text_pole" type="number" min="1000" step="500"></div>
       <div class="cg-row"><div id="cg_jev_test" class="menu_button menu_button_icon"><i class="fa-solid fa-plug-circle-check"></i><span>연결 시험</span></div>

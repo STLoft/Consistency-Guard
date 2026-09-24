@@ -26,6 +26,12 @@
 - 모델: `~typesafe/jev-latest` 또는 `typesafe/jev-1.13`
 - 키: OpenRouter API 키
 
+**TypeSafe 공식 API**
+- API: Custom (OpenAI-compatible)
+- URL: `https://api.typesafe.ai/v1`
+- 모델: `jev-latest` 또는 `jev-1.13.0` (`typesafe-ai/jev` 같은 접두사 형식도 자동 변환)
+- 키: [console.typesafe.ai](https://console.typesafe.ai/)에서 발급한 API 키
+
 ST의 OpenRouter 프로필도 지원하지만, 모델 목록에 Jev가 안 보일 수 있어 Custom 방식이 더 편합니다.
 
 OpenRouter는 동봉한 `consistency-guard` 서버 플러그인에서만 처리됩니다. 제브 리콜 플러그인은 Vercel만 지원합니다.
