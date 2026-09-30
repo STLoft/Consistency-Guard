@@ -41,6 +41,7 @@ const SOURCES = {
     groupMembers: { label: '그룹 채팅의 다른 멤버 카드', field: 'OTHER_CHARACTERS', max: 5000, keep: 'head' },
     lorebook:     { label: '로어북 (이번 턴 활성화된 항목만)', field: 'LOREBOOK', max: 6000, keep: 'head' },
     memory:       { label: '메모리 (요약 확장)', field: 'MEMORY', max: 5000, keep: 'tail' },
+    charmMemory:  { label: '참메모리 (이번 턴 주입된 기억)', field: 'CHARM_MEMORY', max: 10000, keep: 'ends' },
     vectors:      { label: '벡터 저장소 검색 결과', field: 'RETRIEVED_PAST', max: 4000, keep: 'tail' },
     authorsNote:  { label: '작가 노트', field: 'AUTHORS_NOTE', max: 2000, keep: 'head' },
     chatVars:     { label: '채팅 변수 (getvar 상태값)', field: 'STATE_VARIABLES', max: 2000, keep: 'head' },
@@ -76,17 +77,17 @@ const CHECKS = {
     },
     memory: {
         label: '과거 사건·기억과 모순',
-        needs: ['memory', 'vectors'],
-        instructions: 'NEW_MESSAGE contradicts established past events in MEMORY or RETRIEVED_PAST (what happened, promises, relationship status, or what characters already know).',
+        needs: ['memory', 'vectors', 'charmMemory'],
+        instructions: 'NEW_MESSAGE contradicts established past events in MEMORY, RETRIEVED_PAST, or CHARM_MEMORY (what happened, promises, unresolved matters, relationship status, or what characters already know).',
     },
     continuity: {
         label: '현재 상황과 모순 (장소·시간·복장·소지품·자세)',
-        needs: ['recentChat', 'authorsNote', 'chatVars', 'firstMessage'],
-        instructions: 'NEW_MESSAGE breaks continuity with the current situation in RECENT_CHAT, AUTHORS_NOTE, STATE_VARIABLES, or FIRST_MESSAGE: location, time of day, clothing, held items, body positions, injuries, stats, or who said or did what.',
+        needs: ['recentChat', 'authorsNote', 'chatVars', 'firstMessage', 'charmMemory'],
+        instructions: 'NEW_MESSAGE breaks continuity with the current situation in RECENT_CHAT, AUTHORS_NOTE, STATE_VARIABLES, FIRST_MESSAGE, or the current-state notes in CHARM_MEMORY: location, time of day, clothing, held items, body positions, injuries, stats, or who said or did what.',
     },
     knowledge: {
         label: '캐릭터가 알 수 없는 정보를 앎',
-        needs: ['recentChat', 'memory', 'vectors'],
+        needs: ['recentChat', 'memory', 'vectors', 'charmMemory'],
         instructions: 'In NEW_MESSAGE, CHARACTER_NAME knows or references information they could not have learned from the conversation or past events provided.',
     },
     user_control: {
@@ -110,7 +111,7 @@ const DEFAULTS = {
     recentMessages: 8,
     sources: {
         charCard: true, exampleDialogue: false, charNote: true, firstMessage: false,
-        userPersona: true, groupMembers: true, lorebook: true, memory: true, vectors: false,
+        userPersona: true, groupMembers: true, lorebook: true, memory: true, charmMemory: true, vectors: false,
         authorsNote: true, chatVars: false, recentChat: true, extra: false,
     },
     checks: {
@@ -125,6 +126,7 @@ const DEFAULTS = {
 
 let busy = false;
 let lastActivatedLore = []; // WORLD_INFO_ACTIVATED로 받은 이번 턴 로어북 항목
+let staleCharmInjection;    // 채팅 전환 시점의 참메모리 주입값 (이전 채팅 것이므로 쓰지 않음)
 
 function settings() {
     extension_settings[EXT] = extension_settings[EXT] || {};
@@ -148,6 +150,10 @@ function settings() {
 function clip(text, max, keep) {
     text = String(text ?? '').trim();
     if (text.length <= max) return text;
+    if (keep === 'ends') {
+        const half = Math.floor((max - 3) / 2);
+        return text.slice(0, half) + '\n…\n' + text.slice(-half);
+    }
     return keep === 'tail' ? '…' + text.slice(-max) : text.slice(0, max) + '…';
 }
 
@@ -208,6 +214,11 @@ const COLLECTORS = {
             if (m) { out.add(String(m).trim()); break; }
         }
         return [...out].join('\n\n');
+    },
+    // 참메모리는 extensionPrompts를 거치지 않고 프롬프트에 직접 주입하며, 마지막 주입문을 여기에 남김
+    charmMemory: () => {
+        const text = globalThis.__charmLastInjection;
+        return typeof text === 'string' && text !== staleCharmInjection ? text : '';
     },
     vectors: ({ ctx }) => ['3_vectors', '4_vectors_data_bank']
         .map(k => ctx.extensionPrompts?.[k]?.value)
@@ -788,6 +799,7 @@ jQuery(() => {
     eventSource.on(event_types.MESSAGE_SWIPED, () => setTimeout(decorateAll, 50));
     eventSource.on(event_types.CHAT_CHANGED, () => {
         lastActivatedLore = [];
+        staleCharmInjection = globalThis.__charmLastInjection;
         setTimeout(decorateAll, 100);
     });
     if (event_types.MORE_MESSAGES_LOADED) {
