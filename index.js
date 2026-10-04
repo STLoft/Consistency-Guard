@@ -78,6 +78,7 @@ const CHECKS = {
     memory: {
         label: '과거 사건·기억과 모순',
         needs: ['memory', 'vectors', 'charmMemory'],
+        itemized: 'charmMemory', // 항목별 대조가 켜져 있으면 이 근거는 그쪽에서 검사
         instructions: 'NEW_MESSAGE contradicts established past events in MEMORY, RETRIEVED_PAST, or CHARM_MEMORY (what happened, promises, unresolved matters, relationship status, or what characters already know).',
     },
     continuity: {
@@ -108,6 +109,8 @@ const DEFAULTS = {
     jevProfileId: '',
     jevTimeoutMs: 8000,
     threshold: 0.6,
+    itemizedMemory: true,
+    itemThreshold: 0.75,
     recentMessages: 8,
     sources: {
         charCard: true, exampleDialogue: false, charNote: true, firstMessage: false,
@@ -250,6 +253,7 @@ function collectState(messageId) {
 
     const state = { CHARACTER_NAME: message.name, USER_NAME: ctx.name1 };
     const present = new Set();
+    const full = {}; // 길이 제한으로 자르기 전 원문
 
     for (const [key, def] of Object.entries(SOURCES)) {
         if (!s.sources[key]) continue;
@@ -259,6 +263,7 @@ function collectState(messageId) {
         } catch (e) {
             console.warn(LOG, `${key} 수집 실패`, e);
         }
+        full[key] = text.trim();
         text = clip(text, def.max, def.keep);
         if (text) {
             state[def.field] = text;
@@ -266,14 +271,16 @@ function collectState(messageId) {
         }
     }
     state.NEW_MESSAGE = message.mes;
-    return { state, present };
+    return { state, present, full };
 }
 
 // 질문이 사용 가능한지: 켜져 있고, needs 중 하나라도 실제 내용이 있음
-function activeChecks(present) {
+function activeChecks(present, itemMode = false) {
     const s = settings();
-    return Object.entries(CHECKS).filter(([key, def]) =>
-        s.checks[key] && (def.needs.length === 0 || def.needs.some(n => present.has(n))));
+    return Object.entries(CHECKS).filter(([key, def]) => {
+        const needs = itemMode ? def.needs.filter(n => n !== def.itemized) : def.needs;
+        return s.checks[key] && (def.needs.length === 0 || needs.some(n => present.has(n)));
+    });
 }
 
 /* ------------------------------------------------------------------ */
@@ -333,7 +340,7 @@ async function postEvaluation(body, timeoutMs) {
         const res = await fetch(endpoint, {
             method: 'POST',
             headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify(body),
+            body: JSON.stringify({ ...body, timeoutMs: Math.max(1500, timeoutMs - 500) }),
             signal: AbortSignal.timeout(timeoutMs),
         });
         if (res.status === 404) { lastError = null; continue; }
@@ -358,7 +365,6 @@ async function postEvaluation(body, timeoutMs) {
 /* ------------------------------------------------------------------ */
 
 async function judgeWithJev(state, checks) {
-    const s = settings();
     if (!checks.length) return {};
     const profile = getJevProfile();
 
@@ -371,14 +377,160 @@ async function judgeWithJev(state, checks) {
         },
     }]));
 
-    const t0 = performance.now();
-    const payload = await postEvaluation({ profile: compactProfile(profile), state, questions }, s.jevTimeoutMs);
-    console.debug(LOG, `Jev ${Math.round(performance.now() - t0)}ms`, payload);
-    if (!payload?.answers) throw new Error('Jev 응답에 answers가 없습니다.');
-
+    const answers = await askJev(profile, state, questions);
     const scores = {};
-    for (const [key] of checks) scores[key] = answerProbability(payload.answers[key]);
+    for (const [key] of checks) scores[key] = answerProbability(answers[key]);
     return scores;
+}
+
+async function askJev(profile, state, questions) {
+    const t0 = performance.now();
+    const payload = await postEvaluation({ profile: compactProfile(profile), state, questions }, settings().jevTimeoutMs);
+    console.debug(LOG, `Jev ${Math.round(performance.now() - t0)}ms · 질문 ${Object.keys(questions).length}개`, payload);
+    if (!payload?.answers) throw new Error('Jev 응답에 answers가 없습니다.');
+    return payload.answers;
+}
+
+/* ------------------------------------------------------------------ */
+/* 1-b단계: 참메모리 항목별 대조                                         */
+/*  주입문을 기억 한 줄 단위로 쪼개 관련 있는 것만 추린 뒤,               */
+/*  항목마다 모순 / 지식 누출 / 충돌 없음 / 불명 중 하나를 고르게 함       */
+/* ------------------------------------------------------------------ */
+
+const ITEM_MAX = 90;             // 관련성 선별에 보낼 최대 항목 수
+const ITEM_DIRECT = 24;          // 이 이하면 선별 없이 바로 대조, 선별 후 남기는 수도 같음
+const ITEM_BATCH = 30;           // 관련성 선별 한 요청의 항목 수
+const ITEM_TEXT_MAX = 500;
+const ITEM_RELEVANCE_FLOOR = 0.35;
+const ITEM_CHOICES = ['contradiction', 'knowledge_leak', 'no_conflict', 'unclear'];
+
+// 섹션 제목 줄: [..], <..>, # .., 또는 짧고 콜론으로 끝나는 줄
+function sectionTitle(line) {
+    if (/^\[.*\]$/.test(line) || /^<\/?[^<>]+>$/.test(line)) return line.replace(/^[\[<]\/?|[\]>]$/g, '').trim();
+    if (/^#{1,6}\s+/.test(line)) return line.replace(/^#{1,6}\s+/, '').trim();
+    if (line.length <= 80 && /[:：]$/.test(line)) return line.slice(0, -1).trim();
+    return null;
+}
+
+function splitMemoryItems(text) {
+    const items = [];
+    const seen = new Set();
+    let section = '';
+    for (const raw of String(text || '').split(/\r?\n/)) {
+        const line = raw.trim();
+        if (!line) continue;
+        const title = sectionTitle(line);
+        if (title !== null) { section = title.slice(0, 80); continue; }
+        const body = line.replace(/^(?:[-•*·▪◦‣▸►]|\d+[.)])\s+/, '').trim();
+        // 너무 짧은 줄은 바로 앞 항목의 이어지는 내용으로 붙임
+        if (body.length < 8) {
+            const last = items[items.length - 1];
+            if (last && last.section === section) last.text = `${last.text} ${body}`.slice(0, ITEM_TEXT_MAX);
+            continue;
+        }
+        if (seen.has(body)) continue;
+        seen.add(body);
+        items.push({ section, text: body.slice(0, ITEM_TEXT_MAX) });
+    }
+    return items;
+}
+
+function bigrams(text) {
+    const compact = String(text || '').toLocaleLowerCase().replace(/[^\p{L}\p{N}]+/gu, '');
+    const out = new Set();
+    for (let i = 0; i < compact.length - 1; i++) out.add(compact.slice(i, i + 2));
+    return out;
+}
+
+// 항목의 글자 쌍 중 새 메시지에도 나오는 비율 (Jev 선별의 보조·대체 기준)
+function overlapScore(itemText, messageGrams) {
+    const grams = bigrams(itemText);
+    if (!grams.size) return 0;
+    let hit = 0;
+    for (const gram of grams) if (messageGrams.has(gram)) hit++;
+    return hit / grams.size;
+}
+
+function itemView(item) {
+    return item.section ? { section: item.section, text: item.text } : { text: item.text };
+}
+
+async function pickRelevantItems(profile, state, items) {
+    const grams = bigrams(state.NEW_MESSAGE);
+    for (const item of items) item.overlap = overlapScore(item.text, grams);
+    if (items.length <= ITEM_DIRECT) return items;
+
+    const pool = items.length > ITEM_MAX
+        ? [...items].sort((a, b) => b.overlap - a.overlap).slice(0, ITEM_MAX)
+        : items;
+    const batches = [];
+    for (let start = 0; start < pool.length; start += ITEM_BATCH) batches.push(pool.slice(start, start + ITEM_BATCH));
+
+    const results = await Promise.allSettled(batches.map(batch => askJev(profile, {
+        NEW_MESSAGE: state.NEW_MESSAGE,
+        RECENT_CHAT: String(state.RECENT_CHAT || '').slice(-3000),
+        memory_items: batch.map(itemView),
+    }, Object.fromEntries(batch.map((_item, index) => [`r${index}`, {
+        type: 'boolean',
+        instructions: `Is memory_items[${index}] relevant to anything NEW_MESSAGE states, implies, or has a character do or know? Count synonyms, paraphrases, the same people, places, promises, or events. Use RECENT_CHAT only to resolve names and context.`,
+        criteria: {
+            true: 'NEW_MESSAGE touches the same fact, event, promise, person, or state as this memory.',
+            false: 'NEW_MESSAGE does not touch what this memory is about.',
+        },
+    }])))));
+
+    // 선별 요청이 실패한 묶음은 글자 겹침만으로 순위를 매김
+    batches.forEach((batch, index) => {
+        const result = results[index];
+        if (result.status !== 'fulfilled') console.warn(LOG, '관련성 선별 실패, 글자 겹침으로 대체:', result.reason);
+        batch.forEach((item, i) => {
+            item.relevance = result.status === 'fulfilled' ? answerProbability(result.value[`r${i}`]) : item.overlap;
+        });
+    });
+    return pool
+        .filter(item => item.relevance >= ITEM_RELEVANCE_FLOOR)
+        .sort((a, b) => (b.relevance + 0.1 * b.overlap) - (a.relevance + 0.1 * a.overlap))
+        .slice(0, ITEM_DIRECT);
+}
+
+async function judgeMemoryItems(state, memoryText) {
+    const profile = getJevProfile();
+    const all = splitMemoryItems(memoryText);
+    if (!all.length) return { total: 0, checked: 0, flagged: [] };
+    const items = await pickRelevantItems(profile, state, all);
+    if (!items.length) return { total: all.length, checked: 0, flagged: [] };
+
+    const questions = Object.fromEntries(items.map((_item, index) => [`m${index}`, {
+        type: 'choice',
+        instructions: `Compare NEW_MESSAGE with established_memories[${index}]. Decide whether NEW_MESSAGE directly contradicts that memory (what happened, a promise and whether it has been kept yet, an unresolved matter, a relationship status, or what someone already knows), or whether CHARACTER_NAME clearly acts on information that this memory explicitly says CHARACTER_NAME does not know. Use RECENT_CHAT only to resolve names and context.`,
+        criteria: {
+            contradiction: 'A clear, direct incompatibility between NEW_MESSAGE and this memory, including treating a still-pending promise or plan as already done.',
+            knowledge_leak: 'CHARACTER_NAME clearly acts on or reveals information that this memory explicitly marks as unknown to them or kept secret from them.',
+            no_conflict: 'Compatible, unrelated, not mentioned, or a plausible development over time.',
+            unclear: 'Cannot be decided from the provided text.',
+        },
+    }]));
+    const answers = await askJev(profile, {
+        CHARACTER_NAME: state.CHARACTER_NAME,
+        USER_NAME: state.USER_NAME,
+        RECENT_CHAT: String(state.RECENT_CHAT || '').slice(-4000),
+        established_memories: items.map(itemView),
+        NEW_MESSAGE: state.NEW_MESSAGE,
+    }, questions);
+
+    const threshold = Number(settings().itemThreshold) || DEFAULTS.itemThreshold;
+    const flagged = [];
+    items.forEach((item, index) => {
+        const answer = answers[`m${index}`];
+        const choice = String(answer?.choice ?? answer?.value ?? '');
+        if (!ITEM_CHOICES.includes(choice)) throw new Error('Jev가 선택형 답을 돌려주지 않았습니다. 이 게이트웨이가 선택형 질문을 지원하는지 연결 시험으로 확인하세요.');
+        if (choice !== 'contradiction' && choice !== 'knowledge_leak') return;
+        // 확신도를 주지 않는 게이트웨이면 선택 자체를 신뢰 (다음 단계의 지시문 모델이 다시 검증)
+        const confidence = Number(answer?.confidence ?? answer?.probability ?? answer?.probabilities?.[choice]);
+        const p = Number.isFinite(confidence) ? Math.max(0, Math.min(1, confidence)) : 1;
+        if (p >= threshold) flagged.push({ item: { section: item.section, text: item.text, choice }, p });
+    });
+    return { total: all.length, checked: items.length, flagged };
 }
 
 /* ------------------------------------------------------------------ */
@@ -389,7 +541,14 @@ async function generateDirective(state, flagged) {
     const s = settings();
     const fill = t => t.replaceAll('CHARACTER_NAME', state.CHARACTER_NAME).replaceAll('USER_NAME', state.USER_NAME);
     const flaggedText = flagged
-        .map(f => `- ${fill(CHECKS[f.key].instructions)} (probability ${f.p.toFixed(2)})`)
+        .map(f => {
+            if (!f.item) return `- ${fill(CHECKS[f.key].instructions)} (probability ${f.p.toFixed(2)})`;
+            const what = f.item.choice === 'knowledge_leak'
+                ? `${state.CHARACTER_NAME} acts on information that this established memory says they do not know`
+                : 'NEW_MESSAGE contradicts this established memory';
+            const where = f.item.section ? ` [${f.item.section}]` : '';
+            return `- ${what}${where}: "${f.item.text}" (confidence ${f.p.toFixed(2)})`;
+        })
         .join('\n');
 
     const sections = Object.entries(state)
@@ -489,33 +648,47 @@ async function runCheck(messageId, { manual = false } = {}) {
     const stillSame = () => getContext().chat[messageId] === message && message.mes === origMes;
 
     try {
-        const { state, present } = collectState(messageId);
-        const checks = activeChecks(present);
-        if (!checks.length) {
+        const { state, present, full } = collectState(messageId);
+        // 참메모리는 한 덩어리 대신 항목별로 대조 (어느 기억과 충돌했는지 특정)
+        const itemMode = !!s.itemizedMemory && !!s.checks.memory && present.has('charmMemory');
+        const checks = activeChecks(present, itemMode);
+        if (!checks.length && !itemMode) {
             if (manual) toast('warning', '켜진 근거 항목에 내용이 없어 검사할 질문이 없습니다.');
             return;
         }
 
-        // 1) Jev 판정
-        let scores;
-        try {
-            scores = await judgeWithJev(state, checks);
-        } catch (e) {
-            console.warn(LOG, 'Jev 실패, 건너뜀:', e);
+        // 1) Jev 판정: 범주별 질문과 항목별 대조를 동시에 보냄
+        const [byCheck, byItem] = await Promise.allSettled([
+            judgeWithJev(state, checks),
+            itemMode ? judgeMemoryItems(state, full.charmMemory) : null,
+        ]);
+        const failures = [byCheck, byItem].filter(r => r.status === 'rejected').map(r => r.reason);
+        for (const e of failures) console.warn(LOG, 'Jev 실패, 건너뜀:', e);
+        if (byCheck.status === 'rejected' && (byItem.status === 'rejected' || !itemMode)) {
+            const e = byCheck.reason;
             const timedOut = e.name === 'TimeoutError' || e.name === 'AbortError';
             if (manual || !timedOut) toast('error', `Jev 판정 실패: ${e.message}`);
             return;
         }
-        const flagged = Object.entries(scores)
-            .filter(([, p]) => p >= s.threshold)
-            .map(([key, p]) => ({ key, p }))
-            .sort((a, b) => b.p - a.p);
+        if (manual && failures.length) toast('warning', `일부 검사를 건너뛰었습니다: ${failures[0].message}`);
+
+        const scores = byCheck.status === 'fulfilled' ? byCheck.value : {};
+        const itemResult = byItem.status === 'fulfilled' ? byItem.value : null;
+        if (itemResult) console.debug(LOG, `참메모리 항목 ${itemResult.total}개 중 ${itemResult.checked}개 대조, 의심 ${itemResult.flagged.length}개`);
+        const flagged = [
+            ...Object.entries(scores).filter(([, p]) => p >= s.threshold).map(([key, p]) => ({ key, p })),
+            ...(itemResult?.flagged || []),
+        ].sort((a, b) => b.p - a.p);
 
         if (!flagged.length) {
             if (manual) toast('success', '설정오류가 감지되지 않았습니다.');
             return;
         }
-        toast('info', `오류 의심: ${flagged.map(f => `${CHECKS[f.key].label.split(' (')[0]} ${Math.round(f.p * 100)}%`).join(', ')}`);
+        const flagLabel = f => f.item
+            ? `${f.item.choice === 'knowledge_leak' ? '모르는 정보' : '기억'} "${f.item.text.slice(0, 18)}${f.item.text.length > 18 ? '…' : ''}"`
+            : CHECKS[f.key].label.split(' (')[0];
+        toast('info', `오류 의심: ${flagged.map(f => `${flagLabel(f)} ${Math.round(f.p * 100)}%`).join(', ')}`);
+        if (itemResult?.flagged.length) scores.memory_items = itemResult.flagged.map(f => ({ ...f.item, confidence: f.p }));
 
         // 2) 지시문 생성
         let directive = await generateDirective(state, flagged);
@@ -607,6 +780,9 @@ function refreshCheckAvailability() {
         $input.prop('disabled', !available);
         $input.closest('label').toggleClass('cg-unavailable', !available);
     }
+    const itemAvailable = !!s.sources.charmMemory && !!s.checks.memory;
+    $('#cg_itemized').prop('disabled', !itemAvailable).closest('label').toggleClass('cg-unavailable', !itemAvailable);
+    $('#cg_item_threshold_row').toggle(itemAvailable && !!s.itemizedMemory);
     $('#cg_recent_row').toggle(!!s.sources.recentChat);
     $('#cg_extra').toggle(!!s.sources.extra);
 }
@@ -672,7 +848,19 @@ async function testJevConnection() {
             [['character', CHECKS.character]],
         );
         const ms = Math.round(performance.now() - t0);
-        setStatus('#cg_jev_test_status', `성공 · ${ms}ms · 모순 확률 ${Math.round(scores.character * 100)}%`, 'ok');
+        let itemNote;
+        try {
+            const result = await judgeMemoryItems(
+                { CHARACTER_NAME: 'Mina', USER_NAME: 'User', NEW_MESSAGE: 'Mina smiled, remembering how nice the dinner she had cooked for User last Friday had been.' },
+                '[Promises still pending]\n• Mina promised to cook dinner for User next Friday; it has not happened yet.',
+            );
+            itemNote = result.flagged.length
+                ? `항목별 대조 정상 (${Math.round(result.flagged[0].p * 100)}%)`
+                : '항목별 대조 응답은 왔지만 시험 모순을 잡지 못함';
+        } catch (e) {
+            itemNote = `항목별 대조 실패: ${e.message}`;
+        }
+        setStatus('#cg_jev_test_status', `성공 · ${ms}ms · 모순 확률 ${Math.round(scores.character * 100)}% · ${itemNote}`, 'ok');
     } catch (e) {
         setStatus('#cg_jev_test_status', e.message, 'error');
     } finally {
@@ -714,6 +902,10 @@ function renderSettings() {
       <div class="cg-checks">${checkBoxes}</div>
       <div class="cg-row"><label for="cg_threshold">오류 판정 기준 <span id="cg_threshold_val"></span></label>
         <input id="cg_threshold" type="range" min="0.3" max="0.95" step="0.05"></div>
+      <label class="checkbox_label"><input type="checkbox" id="cg_itemized"> 참메모리 항목별 대조 (충돌한 기억을 특정)</label>
+      <small>참메모리 주입문을 기억 한 줄씩 나눠 새 응답과 대조합니다. ‘과거 사건·기억과 모순’ 검사와 참메모리 근거가 켜져 있어야 합니다.</small>
+      <div class="cg-row" id="cg_item_threshold_row"><label for="cg_item_threshold">항목 판정 기준 <span id="cg_item_threshold_val"></span></label>
+        <input id="cg_item_threshold" type="range" min="0.5" max="0.95" step="0.05"></div>
 
       <h4>Jev 연결</h4>
       <div class="cg-row"><label for="cg_jev_profile">연결 프로필</label><select id="cg_jev_profile" class="text_pole"></select></div>
@@ -748,8 +940,17 @@ function renderSettings() {
     bind('#cg_toasts', 'showToasts', Boolean, 'checked');
     bind('#cg_threshold', 'threshold', Number);
 
+    bind('#cg_item_threshold', 'itemThreshold', Number);
+    $('#cg_itemized').prop('checked', !!s.itemizedMemory).on('change', function () {
+        s.itemizedMemory = this.checked;
+        saveSettingsDebounced();
+        refreshCheckAvailability();
+    });
+
     const showT = () => $('#cg_threshold_val').text(`(${Number(s.threshold).toFixed(2)})`);
     showT(); $('#cg_threshold').on('input', showT);
+    const showItemT = () => $('#cg_item_threshold_val').text(`(${Number(s.itemThreshold).toFixed(2)})`);
+    showItemT(); $('#cg_item_threshold').on('input', showItemT);
 
     $('[data-cg-source]').on('change', function () {
         s.sources[this.dataset.cgSource] = this.checked;
@@ -759,6 +960,7 @@ function renderSettings() {
     $('[data-cg-check]').on('change', function () {
         s.checks[this.dataset.cgCheck] = this.checked;
         saveSettingsDebounced();
+        refreshCheckAvailability();
     });
     refreshCheckAvailability();
 
