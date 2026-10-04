@@ -45,7 +45,7 @@ const SOURCES = {
     vectors:      { label: '벡터 저장소 검색 결과', field: 'RETRIEVED_PAST', max: 4000, keep: 'tail' },
     authorsNote:  { label: '작가 노트', field: 'AUTHORS_NOTE', max: 2000, keep: 'head' },
     chatVars:     { label: '채팅 변수 (getvar 상태값)', field: 'STATE_VARIABLES', max: 2000, keep: 'head' },
-    recentChat:   { label: '최근 대화', field: 'RECENT_CHAT', max: 8000, keep: 'tail' },
+    recentChat:   { label: '최근 대화 (숨긴 메시지 포함)', field: 'RECENT_CHAT', max: 16000, keep: 'tail' },
     extra:        { label: '추가 텍스트 (아래 입력칸, 매크로 가능)', field: 'EXTRA_CONTEXT', max: 3000, keep: 'head' },
 };
 
@@ -152,11 +152,11 @@ const DEFAULTS = {
     enabled: true,
     mode: 'auto', // auto | confirm | notify
     jevProfileId: '',
-    jevTimeoutMs: 8000,
+    jevTimeoutMs: 10000,
     threshold: 0.6,
     itemizedMemory: true,
     itemThreshold: 0.75,
-    recentMessages: 8,
+    recentMessages: 16,
     sources: {
         charCard: true, exampleDialogue: false, charNote: true, firstMessage: false,
         userPersona: true, groupMembers: true, lorebook: true, memory: true, charmMemory: true, vectors: false,
@@ -190,6 +190,12 @@ function settings() {
     if (!s.timeoutMigrated) {
         if (s.jevTimeoutMs <= 3000) s.jevTimeoutMs = 8000;
         s.timeoutMigrated = true;
+    }
+    // 0.7.1: 최근 대화 범위가 넓어져 예전 기본값(8초·메시지 8개)을 한 번만 올림
+    if (!s.windowMigrated) {
+        if (s.jevTimeoutMs === 8000) s.jevTimeoutMs = 10000;
+        if (s.recentMessages === 8) s.recentMessages = 16;
+        s.windowMigrated = true;
     }
     for (const group of ['sources', 'checks']) {
         for (const [k, v] of Object.entries(DEFAULTS[group])) {
@@ -284,9 +290,12 @@ const COLLECTORS = {
     },
     recentChat: ({ ctx, messageId }) => {
         const n = settings().recentMessages;
+        // 숨긴 메시지도 이야기의 일부이므로 포함하고, 안내·주석 같은 시스템 메시지만 뺀 뒤 n개를 셈
+        const systemNote = m => m.is_system && m.extra?.type && m.extra.type !== 'narrator';
         return ctx.chat
-            .slice(Math.max(0, messageId - n), messageId)
-            .filter(m => !m.is_system)
+            .slice(0, messageId)
+            .filter(m => m?.mes && !systemNote(m))
+            .slice(-n)
             .map(m => `${m.name}: ${m.mes}`)
             .join('\n\n');
     },
