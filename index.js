@@ -52,6 +52,8 @@ const SOURCES = {
 /* ------------------------------------------------------------------ */
 /* Jev 판정 질문 (모두 boolean: true 확률이 높을수록 오류)                  */
 /*  needs: 이 중 하나라도 켜져 있고 내용이 있어야 질문을 보냄               */
+/*  criteria: 기본 판정 기준 대신 쓸 true/false 설명                      */
+/*  notifyOnly: 알림만 하고 수정본은 만들지 않음                           */
 /* ------------------------------------------------------------------ */
 
 const CHECKS = {
@@ -86,10 +88,23 @@ const CHECKS = {
         needs: ['recentChat', 'authorsNote', 'chatVars', 'firstMessage', 'charmMemory'],
         instructions: 'NEW_MESSAGE breaks continuity with the current situation in RECENT_CHAT, AUTHORS_NOTE, STATE_VARIABLES, FIRST_MESSAGE, or the current-state notes in CHARM_MEMORY: location, time of day, clothing, held items, body positions, injuries, stats, or who said or did what.',
     },
+    promise: {
+        label: '아직 안 한 약속·계획을 끝난 일처럼 서술',
+        needs: ['charmMemory', 'memory', 'recentChat'],
+        instructions: 'NEW_MESSAGE treats a promise, plan, or appointment as already carried out, kept, or finished although CHARM_MEMORY, MEMORY, or RECENT_CHAT show it is still pending or only planned; or it carries on with a promise or plan that those sources show was cancelled.',
+        criteria: {
+            true: 'The sources clearly show the promise or plan is still pending (or cancelled), and NEW_MESSAGE states or assumes the opposite.',
+            false: 'NEW_MESSAGE keeps the promise or plan in its established state, actually carries it out in this very scene, or does not touch it; or the sources do not establish its state.',
+        },
+    },
     knowledge: {
         label: '캐릭터가 알 수 없는 정보를 앎',
         needs: ['recentChat', 'memory', 'vectors', 'charmMemory'],
-        instructions: 'In NEW_MESSAGE, CHARACTER_NAME knows or references information they could not have learned from the conversation or past events provided.',
+        instructions: 'In NEW_MESSAGE, CHARACTER_NAME acts on or reveals a specific fact that the provided sources explicitly show CHARACTER_NAME has not been told, that was kept secret from them, or that happened where they could not perceive it.',
+        criteria: {
+            true: 'The sources explicitly establish that CHARACTER_NAME does not know this fact, and NEW_MESSAGE clearly has CHARACTER_NAME know, use, or reveal it.',
+            false: 'CHARACTER_NAME could plausibly know it, the narration merely describes it, or the sources simply do not say whether CHARACTER_NAME learned it. Missing evidence of learning is not a violation.',
+        },
     },
     user_control: {
         label: '{{user}}의 대사·행동·생각을 대신 씀',
@@ -100,6 +115,36 @@ const CHECKS = {
         label: '추가 텍스트 내용과 모순',
         needs: ['extra'],
         instructions: 'NEW_MESSAGE contradicts facts or rules in EXTRA_CONTEXT.',
+    },
+    echo: {
+        label: '[문체·알림만] 유저 입력을 되풀이',
+        needs: ['recentChat'],
+        notifyOnly: true,
+        instructions: 'NEW_MESSAGE spends material space quoting, translating, paraphrasing, or summarizing what USER_NAME just said or did in the last USER_NAME message of RECENT_CHAT, merely to show it was understood, instead of starting from the response, consequence, or next development.',
+        criteria: {
+            true: 'A noticeable part of NEW_MESSAGE restates the latest user input without adding anything.',
+            false: 'NEW_MESSAGE moves on from the input; any repeated detail is needed for what changes now.',
+        },
+    },
+    repetition: {
+        label: '[문체·알림만] 같은 내용 반복',
+        needs: ['recentChat'],
+        notifyOnly: true,
+        instructions: 'NEW_MESSAGE repeats a position, emotion, threat, explanation, or question that CHARACTER_NAME already expressed in their earlier messages in RECENT_CHAT, in different words, while the interaction stays materially unchanged.',
+        criteria: {
+            true: 'The same point is paraphrased again and nothing material is added or changed.',
+            false: 'The exchange adds or changes something material, or RECENT_CHAT has no comparable earlier message.',
+        },
+    },
+    closing: {
+        label: '[문체·알림만] 같은 마무리 패턴',
+        needs: ['recentChat'],
+        notifyOnly: true,
+        instructions: 'NEW_MESSAGE ends with materially the same closing device as at least two earlier CHARACTER_NAME messages in RECENT_CHAT: for example a question back to USER_NAME, an either/or choice, a countdown, or passively waiting for USER_NAME to act.',
+        criteria: {
+            true: 'At least two earlier CHARACTER_NAME messages and NEW_MESSAGE close in the same way.',
+            false: 'The endings vary, or fewer than two comparable earlier messages exist.',
+        },
     },
 };
 
@@ -119,7 +164,8 @@ const DEFAULTS = {
     },
     checks: {
         character: true, persona: true, world: true, others: true, memory: true,
-        continuity: true, knowledge: true, user_control: false, extra: true,
+        continuity: true, promise: true, knowledge: true, user_control: false, extra: true,
+        echo: false, repetition: false, closing: false,
     },
     extraContextTemplate: '',
     directiveProfileId: '',
@@ -128,6 +174,9 @@ const DEFAULTS = {
 };
 
 let busy = false;
+let queuedMessageId = null; // 검사 중에 도착한 가장 최근 응답 (끝나면 이어서 검사)
+const history = [];         // 이 채팅의 최근 검수 결과 (최신이 앞)
+const HISTORY_MAX = 5;
 let lastActivatedLore = []; // WORLD_INFO_ACTIVATED로 받은 이번 턴 로어북 항목
 let staleCharmInjection;    // 채팅 전환 시점의 참메모리 주입값 (이전 채팅 것이므로 쓰지 않음)
 
@@ -287,12 +336,8 @@ function activeChecks(present, itemMode = false) {
 /* Jev 연결: 연결 프로필 + 서버 플러그인 (키는 서버 안에서만 읽음)          */
 /* ------------------------------------------------------------------ */
 
-// 자체 플러그인을 먼저 찾고, 없으면 이미 설치된 제브 리콜 플러그인을 재사용
-const PLUGIN_ENDPOINTS = [
-    '/api/plugins/consistency-guard/evaluate',
-    '/api/plugins/jev-recall/evaluate',
-];
-let workingEndpoint = null;
+// 제브 리콜과 같은 서버 플러그인(plugins/jev-recall)을 함께 씀
+const PLUGIN_ENDPOINT = '/api/plugins/jev-recall/evaluate';
 
 function jevProvider(profile) {
     if (profile?.api === 'openrouter') return 'OpenRouter';
@@ -334,30 +379,23 @@ function answerProbability(answer) {
 }
 
 async function postEvaluation(body, timeoutMs) {
-    const candidates = workingEndpoint ? [workingEndpoint] : PLUGIN_ENDPOINTS;
-    let lastError = null;
-    for (const endpoint of candidates) {
-        const res = await fetch(endpoint, {
-            method: 'POST',
-            headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
-            body: JSON.stringify({ ...body, timeoutMs: Math.max(1500, timeoutMs - 500) }),
-            signal: AbortSignal.timeout(timeoutMs),
-        });
-        if (res.status === 404) { lastError = null; continue; }
-        const text = await res.text();
-        let payload = null;
-        try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
-        if (!res.ok) {
-            const detail = payload?.error?.message || payload?.error || text || res.statusText;
-            const hint = endpoint.includes('jev-recall') && /Custom/.test(String(detail))
-                ? ' (OpenRouter 프로필은 동봉한 consistency-guard 서버 플러그인이 필요합니다)' : '';
-            lastError = new Error(`Jev HTTP ${res.status}: ${String(detail).slice(0, 300)}${hint}`);
-            break;
-        }
-        workingEndpoint = endpoint;
-        return payload;
+    const res = await fetch(PLUGIN_ENDPOINT, {
+        method: 'POST',
+        headers: { ...getRequestHeaders(), 'Content-Type': 'application/json' },
+        body: JSON.stringify({ ...body, timeoutMs: Math.max(1500, timeoutMs - 500) }),
+        signal: AbortSignal.timeout(timeoutMs),
+    });
+    if (res.status === 404) {
+        throw new Error('Jev 서버 플러그인(plugins/jev-recall)을 찾지 못했습니다. 설치와 enableServerPlugins: true를 확인하고 ST를 재시작하세요.');
     }
-    throw lastError || new Error('Jev 서버 플러그인을 찾지 못했습니다. plugins 폴더 설치와 enableServerPlugins: true를 확인하고 ST를 재시작하세요.');
+    const text = await res.text();
+    let payload = null;
+    try { payload = text ? JSON.parse(text) : null; } catch { payload = null; }
+    if (!res.ok) {
+        const detail = payload?.error?.message || payload?.error || text || res.statusText;
+        throw new Error(`Jev HTTP ${res.status}: ${String(detail).slice(0, 300)}`);
+    }
+    return payload;
 }
 
 /* ------------------------------------------------------------------ */
@@ -371,7 +409,7 @@ async function judgeWithJev(state, checks) {
     const questions = Object.fromEntries(checks.map(([key, def]) => [key, {
         type: 'boolean',
         instructions: def.instructions,
-        criteria: {
+        criteria: def.criteria || {
             true: 'NEW_MESSAGE clearly contradicts or violates what the provided sources establish.',
             false: 'NEW_MESSAGE is consistent, or the provided sources do not establish this detail at all.',
         },
@@ -636,16 +674,60 @@ function addRevisionSwipe(message, revisedText, directive, scores) {
 /* 파이프라인                                                           */
 /* ------------------------------------------------------------------ */
 
+// 검수 결과 한 건을 기록하고 설정 화면에 표시
+const OUTCOMES = {
+    pass:      { text: '모순 없음', kind: 'ok' },
+    revised:   { text: '수정본 추가', kind: 'ok' },
+    cleared:   { text: '재검토 결과 오류 아님', kind: 'ok' },
+    notified:  { text: '지시문만 표시', kind: 'warn' },
+    style:     { text: '문체 알림', kind: 'warn' },
+    dismissed: { text: '지시문 무시함', kind: 'warn' },
+    skipped:   { text: '건너뜀', kind: 'error' },
+    failed:    { text: '오류', kind: 'error' },
+};
+
+function record(entry) {
+    history.unshift({ at: Date.now(), ...entry });
+    history.length = Math.min(history.length, HISTORY_MAX);
+    renderHistory();
+}
+
+function renderHistory() {
+    const $box = $('#cg_history');
+    if (!$box.length) return;
+    $box.empty();
+    if (!history.length) { $box.text('이 채팅에서 아직 검사한 응답이 없습니다.'); return; }
+    history.forEach((entry, index) => {
+        const outcome = OUTCOMES[entry.outcome] || OUTCOMES.failed;
+        const time = new Date(entry.at).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+        const head = `${time} · #${entry.messageId} · ${outcome.text}${entry.ms ? ` · ${(entry.ms / 1000).toFixed(1)}초` : ''}`;
+        const $row = $('<details class="cg-history-row">').toggleClass('is-ok', outcome.kind === 'ok')
+            .toggleClass('is-warn', outcome.kind === 'warn').toggleClass('is-error', outcome.kind === 'error');
+        if (index === 0) $row.attr('open', '');
+        $row.append($('<summary>').text(head));
+        const lines = [entry.note, ...(entry.flags || [])].filter(Boolean);
+        $row.append($('<pre>').text(lines.length ? lines.join('\n') : '추가 내용 없음'));
+        $box.append($row);
+    });
+}
+
 async function runCheck(messageId, { manual = false } = {}) {
     const s = settings();
     const ctx = getContext();
     const message = ctx.chat[messageId];
     if (!message || message.is_user || message.is_system) return;
-    if (busy) { if (manual) toast('warning', '이미 검사 중입니다.'); return; }
+    if (busy) {
+        if (manual) toast('warning', '이미 검사 중입니다.');
+        else queuedMessageId = messageId;
+        return;
+    }
 
     busy = true;
+    const startedAt = performance.now();
     const origMes = message.mes;
     const stillSame = () => getContext().chat[messageId] === message && message.mes === origMes;
+    let flagLines = [];
+    const done = (outcome, note = '') => record({ messageId, outcome, note, flags: flagLines, ms: Math.round(performance.now() - startedAt) });
 
     try {
         const { state, present, full } = collectState(messageId);
@@ -654,7 +736,7 @@ async function runCheck(messageId, { manual = false } = {}) {
         const checks = activeChecks(present, itemMode);
         if (!checks.length && !itemMode) {
             if (manual) toast('warning', '켜진 근거 항목에 내용이 없어 검사할 질문이 없습니다.');
-            return;
+            return done('skipped', '켜진 근거 항목에 내용이 없어 보낼 질문이 없었습니다.');
         }
 
         // 1) Jev 판정: 범주별 질문과 항목별 대조를 동시에 보냄
@@ -664,63 +746,89 @@ async function runCheck(messageId, { manual = false } = {}) {
         ]);
         const failures = [byCheck, byItem].filter(r => r.status === 'rejected').map(r => r.reason);
         for (const e of failures) console.warn(LOG, 'Jev 실패, 건너뜀:', e);
+        const describe = e => (e.name === 'TimeoutError' || e.name === 'AbortError')
+            ? `Jev 응답이 ${Math.round(s.jevTimeoutMs / 100) / 10}초 안에 오지 않았습니다.` : e.message;
         if (byCheck.status === 'rejected' && (byItem.status === 'rejected' || !itemMode)) {
             const e = byCheck.reason;
             const timedOut = e.name === 'TimeoutError' || e.name === 'AbortError';
             if (manual || !timedOut) toast('error', `Jev 판정 실패: ${e.message}`);
-            return;
+            return done('skipped', `검사하지 못했습니다 — ${describe(e)}`);
         }
         if (manual && failures.length) toast('warning', `일부 검사를 건너뛰었습니다: ${failures[0].message}`);
+        const partial = failures.length
+            ? `${byCheck.status === 'rejected' ? '범주별 검사' : '참메모리 항목별 대조'}는 건너뜀 — ${describe(failures[0])}` : '';
 
         const scores = byCheck.status === 'fulfilled' ? byCheck.value : {};
         const itemResult = byItem.status === 'fulfilled' ? byItem.value : null;
         if (itemResult) console.debug(LOG, `참메모리 항목 ${itemResult.total}개 중 ${itemResult.checked}개 대조, 의심 ${itemResult.flagged.length}개`);
-        const flagged = [
+        const coverage = [
+            checks.length ? `범주 ${checks.length}개` : '',
+            itemResult ? `참메모리 ${itemResult.checked}/${itemResult.total}개 대조` : '',
+            partial,
+        ].filter(Boolean).join(' · ');
+
+        const all = [
             ...Object.entries(scores).filter(([, p]) => p >= s.threshold).map(([key, p]) => ({ key, p })),
             ...(itemResult?.flagged || []),
         ].sort((a, b) => b.p - a.p);
-
-        if (!flagged.length) {
-            if (manual) toast('success', '설정오류가 감지되지 않았습니다.');
-            return;
-        }
         const flagLabel = f => f.item
             ? `${f.item.choice === 'knowledge_leak' ? '모르는 정보' : '기억'} "${f.item.text.slice(0, 18)}${f.item.text.length > 18 ? '…' : ''}"`
             : CHECKS[f.key].label.split(' (')[0];
+        flagLines = all.map(f => `• ${f.item ? `${f.item.choice === 'knowledge_leak' ? '모르는 정보' : '기억과 모순'}: ${f.item.text}` : CHECKS[f.key].label} — ${Math.round(f.p * 100)}%`);
+
+        // 문체 검사는 알리기만 하고 수정본을 만들지 않음
+        const style = all.filter(f => !f.item && CHECKS[f.key].notifyOnly);
+        const flagged = all.filter(f => !style.includes(f));
+        if (style.length) toast('warning', `문체 알림: ${style.map(f => `${flagLabel(f).replace('[문체·알림만] ', '')} ${Math.round(f.p * 100)}%`).join(', ')}`);
+
+        if (!flagged.length) {
+            if (manual && !style.length) toast('success', '설정오류가 감지되지 않았습니다.');
+            return done(style.length ? 'style' : 'pass', coverage);
+        }
         toast('info', `오류 의심: ${flagged.map(f => `${flagLabel(f)} ${Math.round(f.p * 100)}%`).join(', ')}`);
         if (itemResult?.flagged.length) scores.memory_items = itemResult.flagged.map(f => ({ ...f.item, confidence: f.p }));
 
         // 2) 지시문 생성
         let directive = await generateDirective(state, flagged);
-        if (!directive) { toast('success', '재검토 결과 실제 오류는 없었습니다.'); return; }
-        if (!stillSame()) return;
+        if (!directive) { toast('success', '재검토 결과 실제 오류는 없었습니다.'); return done('cleared', coverage); }
+        if (!stillSame()) return done('skipped', '검사 중에 메시지가 바뀌어 중단했습니다.');
 
         if (s.mode === 'notify') {
+            done('notified', directive);
             await callGenericPopup(`<h3>수정 지시문</h3><pre style="white-space:pre-wrap;text-align:left">${escapeHtml(directive)}</pre>`, POPUP_TYPE.TEXT);
             return;
         }
         if (s.mode === 'confirm') {
             const edited = await callGenericPopup('수정 지시문 (편집 가능)', POPUP_TYPE.INPUT, directive, { rows: 8, okButton: '수정본 생성', cancelButton: '무시' });
-            if (!edited) return;
+            if (!edited) return done('dismissed', directive);
             directive = String(edited);
         }
-        if (!stillSame()) return;
+        if (!stillSame()) return done('skipped', '검사 중에 메시지가 바뀌어 중단했습니다.');
 
         // 3) 수정본 생성
         toast('info', '수정본 생성 중…');
         const revised = await quietGenerate(buildRevisionPrompt(message.mes, directive));
-        if (!revised) { toast('error', '수정본이 비어 있습니다.'); return; }
-        if (!stillSame()) { toast('warning', '메시지가 바뀌어 수정본을 버렸습니다.'); return; }
+        if (!revised) { toast('error', '수정본이 비어 있습니다.'); return done('failed', '수정본 생성 결과가 비어 있었습니다.'); }
+        if (!stillSame()) { toast('warning', '메시지가 바뀌어 수정본을 버렸습니다.'); return done('skipped', '수정본을 만드는 동안 메시지가 바뀌어 버렸습니다.'); }
 
         addRevisionSwipe(message, revised, directive, scores);
         await saveChatConditional();
         await reloadCurrentChat();
         toast('success', '수정본을 새 스와이프로 추가했습니다. 왼쪽으로 넘기면 원본이 있습니다.');
+        done('revised', directive);
     } catch (e) {
         console.error(LOG, e);
         toast('error', `오류: ${e.message}`);
+        done('failed', e.message);
     } finally {
         busy = false;
+        // 검사 중에 도착한 응답이 있으면 가장 최근 것 하나를 이어서 검사
+        const next = queuedMessageId;
+        queuedMessageId = null;
+        if (next !== null && next !== messageId && settings().enabled) {
+            const queued = getContext().chat[next];
+            if (queued && !queued.extra?.cg_revised && !queued.extra?.instead_revised) setTimeout(() => runCheck(next), 0);
+        }
     }
 }
 
@@ -884,6 +992,10 @@ function renderSettings() {
     </div>
     <div class="inline-drawer-content">
       <label class="checkbox_label"><input type="checkbox" id="cg_enabled" ${s.enabled ? 'checked' : ''}> 응답마다 자동 검사</label>
+      <details class="cg-history" open>
+        <summary>최근 검수 결과</summary>
+        <div id="cg_history"></div>
+      </details>
       <div class="cg-row"><label for="cg_mode">오류 발견 시</label>
         <select id="cg_mode" class="text_pole">
           <option value="auto">바로 수정본 생성</option>
@@ -963,6 +1075,7 @@ function renderSettings() {
         refreshCheckAvailability();
     });
     refreshCheckAvailability();
+    renderHistory();
 
     installProfileDropdowns();
     $('#cg_jev_test').on('click', testJevConnection);
@@ -1001,6 +1114,9 @@ jQuery(() => {
     eventSource.on(event_types.MESSAGE_SWIPED, () => setTimeout(decorateAll, 50));
     eventSource.on(event_types.CHAT_CHANGED, () => {
         lastActivatedLore = [];
+        queuedMessageId = null;
+        history.length = 0;
+        renderHistory();
         staleCharmInjection = globalThis.__charmLastInjection;
         setTimeout(decorateAll, 100);
     });

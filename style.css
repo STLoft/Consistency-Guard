@@ -13,3 +13,11 @@
 .cg-settings .cg-status.is-ok { color: var(--SmartThemeQuoteColor); opacity: 1; }
 .cg-settings .cg-status.is-error { color: var(--warning, #e5a50a); opacity: 1; }
 .cg-settings .menu_button.disabled { pointer-events: none; opacity: .5; }
+.cg-history { margin: 6px 0 8px; }
+.cg-history > summary { cursor: pointer; user-select: none; font-weight: 600; }
+.cg-history-row { margin-top: 4px; padding: 3px 8px; border-left: 3px solid var(--SmartThemeBorderColor, #888); font-size: .9em; }
+.cg-history-row.is-ok { border-left-color: var(--SmartThemeQuoteColor, #6a6); }
+.cg-history-row.is-warn { border-left-color: var(--warning, #e5a50a); }
+.cg-history-row.is-error { border-left-color: var(--fullred, #d33); }
+.cg-history-row summary { cursor: pointer; }
+.cg-history-row pre { white-space: pre-wrap; margin: 4px 0 2px; font-family: inherit; opacity: .85; }
